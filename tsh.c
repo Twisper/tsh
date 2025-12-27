@@ -24,7 +24,7 @@ int main() {
     char *username = getenv("USER");
     char *hostname = getenv("HOSTNAME");
     char *pwd;
-    char homedir = "~";
+    char homedir[2] = "~";
 
     while (1) {
         pwd = extract_pwd(getenv("PWD"));
@@ -47,7 +47,7 @@ static char *extract_pwd(char *pwd) {
         i--;
     }
 
-    return ret_ptr + i + 1;
+    return ret_ptr + i;
 }
 
 static void eval(char *cmdline) {
