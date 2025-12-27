@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #define	MAXLINE 8192
 #define MAXARGS 128
@@ -23,19 +25,29 @@ static char *extract_pwd(char *pwd);
 int main() {
 
     char cmdline[MAXLINE];
+    char prompt[1024];
     char *username = getenv("USER");
     char *hostname = getenv("HOSTNAME");
     char *cwd[1024];
     char *pwd;
     char homedir[2] = "~";
+    char *input;
+
+    using_history();
 
     while (1) {
         if ((pwd = extract_pwd(getenv("PWD"))) == NULL)
             pwd = homedir;
-        printf("%s@%s: %s %% ", username, hostname, pwd);
-        if (fgets(cmdline, MAXLINE, stdin) == NULL) break;
+        snprintf(prompt, sizeof(prompt), "%s@%s: %s %% ", username, hostname, pwd);
+        input = readline(prompt);
 
-        eval(cmdline);
+        if (!input) break;
+
+        if (*input) add_history(input);
+
+        eval(input);
+
+        free(input);
     }
 }
 
@@ -89,7 +101,6 @@ static int parseline(char *buf, char **argv) {
     int argc;
     int bg;
 
-    buf[strlen(buf)-1] = ' ';
     while (*buf && (*buf == ' '))
         buf++;
 
@@ -100,6 +111,9 @@ static int parseline(char *buf, char **argv) {
         buf = delim + 1;
         while (*buf && (*buf == ' '))
             buf++;
+    }
+    if (*buf != '\0') {
+        argv[argc++] = buf;
     }
     argv[argc] = NULL;
 
@@ -134,4 +148,23 @@ static int builtin_command(char **argv) {
         //export(argv);
         return 1;
     }
+    if (!strcmp(argv[0], "history")) {
+        HIST_ENTRY **hist = history_list();
+        if (hist) {
+            printf("History of your commands:\n");
+            for (int i = 0; hist[i]; i++) {
+                printf("%d: %s\n", i, hist[i]->line);
+            }
+        }
+        return 1;
+    }
+    if (!strcmp(argv[0], "kill")) {
+        
+        return 1;
+    }
+    if (!strcmp(argv[0], "unset")) {
+        
+        return 1;
+    }
+    return 0;
 }
