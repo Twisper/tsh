@@ -12,7 +12,8 @@
 
 #define	MAXLINE 8192
 #define MAXARGS 128
-#define MAXDIRLEN 64
+#define PATHDIRLEN 64
+#define MAXDIRLEN 128
 
 extern char **environ;
 
@@ -72,6 +73,9 @@ static void eval(char *cmdline) {
     int bg;
     pid_t pid;
     char *path = getenv("PATH");
+    char *pathdir;
+    char *execute_dir;
+    char dir_with_path[MAXDIRLEN];
 
     strcpy(buf, cmdline);
     bg = parseline(buf, argv);
@@ -79,13 +83,24 @@ static void eval(char *cmdline) {
         return;
 
     if (!builtin_command(argv)) {
+        if (strchr(argv[0], '/') == NULL) {
+            pathdir = strtok(path, ":");
+            while (pathdir != NULL){
+                snprintf(dir_with_path, sizeof(dir_with_path), "%s/%s", pathdir, argv[0]);
+                if (access(dir_with_path, X_OK) == 0) {
+                    execute_dir = dir_with_path;
+                    break;
+                }
+                pathdir = strtok(NULL, ":");
+            }
+        } else
+            execute_dir = argv[0];
         if ((pid = fork()) == 0) {
-            if (execve(argv[0], argv, environ) < 0) {
+            if (execve(execute_dir, argv, environ) < 0) {
                 printf("%s: Command not found.\n", argv[0]);
                 exit(0);
             }
         }
-
         if (!bg) {
             int status;
             if (waitpid(pid, &status, 0) < 0)
