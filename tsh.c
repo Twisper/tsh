@@ -10,13 +10,16 @@
 
 #define	MAXLINE 8192
 #define MAXARGS 128
+#define NAME_MAXLEN 128
 
 int main() {
 
     char cmdline[MAXLINE];
+    char *username = getenv("USER");
+    char *hostname = getenv("HOSTNAME");
 
     while (1) {
-        printf("/>");
+        printf("%s@%s:~$", username, hostname);
         fgets(cmdline, MAXLINE, stdin);
         if (feof(stdin))
             continue;
