@@ -14,8 +14,20 @@
 #define MAXARGS 128
 #define PATHDIRLEN 64
 #define MAXDIRLEN 128
+#define MAXJOBS 16
 
 extern char **environ;
+
+typedef enum {UNDEF, FG, BG, STOPPED} job_state_t;
+
+struct job_t {
+    pid_t pid;
+    size_t jid;
+    job_state_t state;
+    char cmdline[MAXLINE];
+};
+
+struct job_t jobs[MAXJOBS];
 
 static void eval(char *cmdline);
 static int builtin_command(char **argv);
@@ -160,7 +172,13 @@ static int builtin_command(char **argv) {
         return 1;
     }
     if (!strcmp(argv[0], "export")) {
-        //export(argv);
+        char *envvar = strtok(argv[1], "=");
+        char *newval = strtok(NULL, "=");
+        if ((envvar != NULL) && (newval != NULL)) {
+            if (setenv(envvar, newval, 1) != 0) {
+                fprintf(stderr, "ERROR: couldn't set %s variable", envvar);
+            }
+        }
         return 1;
     }
     if (!strcmp(argv[0], "history")) {
@@ -173,11 +191,23 @@ static int builtin_command(char **argv) {
         }
         return 1;
     }
-    if (!strcmp(argv[0], "kill")) {
+    if (!strcmp(argv[0], "unset")) {
+        unsetenv(argv[1]);
+        return 1;
+    }
+    if (!strcmp(argv[0], "jobs")) {
         
         return 1;
     }
-    if (!strcmp(argv[0], "unset")) {
+    if (!strcmp(argv[0], "fg")) {
+        
+        return 1;
+    }
+    if (!strcmp(argv[0], "bg")) {
+        
+        return 1;
+    }
+    if (!strcmp(argv[0], "kill")) {
         
         return 1;
     }
