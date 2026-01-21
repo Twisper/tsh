@@ -4,11 +4,13 @@
 #include <stddef.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <string.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <fcntl.h>
 
 #define	MAXLINE 8192
 #define MAXARGS 128
@@ -16,6 +18,12 @@
 #define MAXDIRLEN 128
 #define MAXJOBS 16
 #define MAXCMDLINE 512
+
+#ifdef DEBUG
+#define LOG(fmt, ...) fprintf(stderr, "[LOG] %s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
+#else
+#define LOG(fmt, ...)
+#endif
 
 extern char **environ;
 
@@ -33,13 +41,20 @@ typedef struct _job {
     char cmdline[MAXCMDLINE];
 } job_t;
 
+typedef struct _command_t {
+    char *argv[MAXARGS];
+    char *infile;
+    char *outfile;
+    int append;
+} command_t;
+
 size_t jobs_count;
 
 job_t jobs[MAXJOBS];
 
 static void eval(char *cmdline);
 static int builtin_command(char **argv);
-static int parseline(char *buf, char **argv);
+static int parseline(char *buf, command_t *command);
 static void export(char **argv);
 static char *extract_pwd(char *pwd);
 static int add_job(pid_t pid, job_state_t state, char *cmdline);
@@ -48,6 +63,7 @@ static job_t *get_job(pid_t pid, size_t jid);
 static job_t *parse_arg(char *arg);
 static void waitfg(pid_t pid);
 static void reason_print(void);
+static void string_copy(char *oldstr, char *newstr);
 
 void sigchld_handler(int sig) {
     int status;
@@ -56,7 +72,6 @@ void sigchld_handler(int sig) {
 
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
         job_t *curr_job = get_job(pid, 0);
-        size_t curr_jid = curr_job->jid;
         if (WIFEXITED(status)) {
             curr_job->flags.is_edited = 1;
             curr_job->flags.reason = FINISHED;
@@ -133,37 +148,42 @@ static char *extract_pwd(char *pwd) {
 
 static void eval(char *cmdline) {
 
-    char *argv[MAXARGS];
-    char buf[MAXLINE];
+    //char *argv[MAXARGS];
+    char buf[2*MAXLINE];
     int bg;
     pid_t pid;
     char *path = getenv("PATH");
     char *pathdir;
     char *execute_dir = NULL;
     char dir_with_path[MAXDIRLEN];
+    command_t command;
     sigset_t mask, prev_mask;
     
     size_t pathlen = strlen(path);
     char path_copy[pathlen];
 
+    command.append = 0;
+    command.infile = NULL;
+    command.outfile = NULL;
+
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
 
-    strcpy(buf, cmdline);
-    bg = parseline(buf, argv);
-    if (argv[0] == NULL)
+    string_copy(cmdline, buf);
+    bg = parseline(buf, &command);
+    if (command.argv[0] == NULL)
         return;
 
-    if (!builtin_command(argv)) {
+    if (!builtin_command(command.argv)) {
         if (jobs_count == 16) {
             fprintf(stderr, "ERROR: Сouldn't launch more jobs, wait for current jobs to end.\n");
             return;
         }
-        if (strchr(argv[0], '/') == NULL) {
+        if (strchr(command.argv[0], '/') == NULL) {
             strcpy(path_copy, path);
             pathdir = strtok(path_copy, ":");
             while (pathdir != NULL){
-                snprintf(dir_with_path, sizeof(dir_with_path), "%s/%s", pathdir, argv[0]);
+                snprintf(dir_with_path, sizeof(dir_with_path), "%s/%s", pathdir, command.argv[0]);
                 if (access(dir_with_path, X_OK) == 0) {
                     execute_dir = dir_with_path;
                     break;
@@ -171,18 +191,38 @@ static void eval(char *cmdline) {
                 pathdir = strtok(NULL, ":");
             }
         } else
-            execute_dir = argv[0];
+            execute_dir = command.argv[0];
         
         sigprocmask(SIG_BLOCK, &mask, &prev_mask);
         if ((pid = fork()) == 0) {
             setpgid(0, 0);
+
             sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
             signal(SIGINT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
             signal(SIGTTOU, SIG_DFL);
             signal(SIGTTIN, SIG_DFL);
-            if (execve(execute_dir, argv, environ) < 0) {
-                printf("%s: Command not found.\n", argv[0]);
+
+            if (command.infile != NULL) {
+                int fd_in = open(command.infile, O_RDONLY);
+                dup2(fd_in, STDIN_FILENO);
+                close(fd_in);
+            }
+
+            if (command.outfile != NULL) {
+                int flags = O_WRONLY | O_CREAT;
+                if (command.append) {
+                    flags |= O_APPEND;
+                } else {
+                    flags |= O_TRUNC;
+                }
+                int fd_out = open(command.outfile, flags, 0644);
+                int test_fd = dup2(fd_out, STDOUT_FILENO);
+                close(fd_out);
+            }
+
+            if (execve(execute_dir, command.argv, environ) < 0) {
+                printf("%s: Command not found.\n", command.argv[0]);
                 exit(0);
             }
         }
@@ -202,32 +242,81 @@ static void eval(char *cmdline) {
     return;
 }
 
-static int parseline(char *buf, char **argv) {
+static void string_copy(char *oldstr, char *newstr) {
+    while (*oldstr) {
+        if (*oldstr == '>' && *(oldstr+1) == '>') {
+            *newstr++ = ' ';
+            *newstr++ = '>';
+            *newstr++ = '>';
+            *newstr++ = ' ';
+            oldstr += 2;       
+            continue;
+        }
+
+        if (*oldstr == '<' || *oldstr == '>' || *oldstr == '|') {
+            *newstr++ = ' ';
+            *newstr++ = *oldstr;
+            *newstr++ = ' ';
+            oldstr++;
+            continue;
+        }
+
+        *newstr++ = *oldstr++;
+    }
+    *newstr = ' ';
+    *(newstr+1) = '\0';
+}
+
+static int parseline(char *buf, command_t *command) {
 
     char *delim;
     int argc;
     int bg;
+    int expect_infile = 0, expect_outfile = 0;
 
-    while (*buf && (*buf == ' '))
+    while (*buf && (*buf == ' ')) //Skipping spaces in the beginning
         buf++;
 
     argc = 0;
+
     while ((delim = strchr(buf, ' '))) {
-        argv[argc++] = buf;
         *delim = '\0';
+        LOG("Current argument: %s", buf);
+        if (strcmp(buf, "<") == 0) {
+            expect_infile = 1;
+        } 
+        else if (strcmp(buf, ">") == 0) {
+            expect_outfile = 1;
+            command->append = 0;
+        }
+        else if (strcmp(buf, ">>") == 0) {
+            expect_outfile = 1;
+            command->append = 1;
+        }
+        else {
+            if (expect_infile) {
+                command->infile = buf;
+                expect_infile = 0;
+            } else if (expect_outfile) {
+                command->outfile = buf;
+                expect_outfile = 0;
+            } else {
+                command->argv[argc++] = buf;
+            }
+        }
+        
         buf = delim + 1;
-        while (*buf && (*buf == ' '))
-            buf++;
+        while (*buf && (*buf == ' ')) buf++;
     }
-    if (*buf != '\0') {
-        argv[argc++] = buf;
-    }
-    argv[argc] = NULL;
+    /*if (*buf != '\0') {  //If there is something after all of these arguments, saving this as a pointer to this
+        command->argv[argc++] = buf;
+    } */
+    command->argv[argc] = NULL; //Last pointer is NULL
 
     if (argc == 0) return 1;
 
-    if ((bg = (*argv[argc-1] == '&')) != 0)
-        argv[--argc] = NULL;
+    if ((bg = (*(command->argv[argc-1]) == '&')) != 0) //If the last argument is &, changing bg to 1 and pointer to this argument becomes NULL
+        command->argv[--argc] = NULL;
 
     return bg;
 }
@@ -409,15 +498,17 @@ static void reason_print() {
                 size_t curr_jid = jobs[i].jid;
                 pid_t curr_pid = jobs[i].pid;
                 if (stop_reason == FINISHED) {
-                    printf("Job [%ld] (%d) is finished\n", curr_jid, curr_pid);
+                    if (jobs[i].state == BG) {
+                        printf("Job [%ld] (%d) is finished\n", curr_jid, curr_pid);
+                    }
                     delete_job(jobs+i);
                 }
                 else if (stop_reason == SIGNAL) {
-                    printf("Job [%ld] (%d) terminated by signal\n", curr_jid, curr_pid);
+                    printf("\nJob [%ld] (%d) terminated by signal\n", curr_jid, curr_pid);
                     delete_job(jobs+i);
                 }
                 else if (stop_reason == FREEZED) {
-                    printf("Job [%ld] (%d) stopped by signal\n", curr_jid, curr_pid);
+                    printf("\nJob [%ld] (%d) stopped by signal\n", curr_jid, curr_pid);
                 }
                 jobs[i].flags.is_edited = 0;
                 jobs[i].flags.reason = NONE;
