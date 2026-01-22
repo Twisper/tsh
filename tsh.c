@@ -46,6 +46,8 @@ typedef struct _command_t {
     char *infile;
     char *outfile;
     int append;
+    int pipe_fd_in;
+    int pipe_fd_out;
 } command_t;
 
 size_t jobs_count;
@@ -54,7 +56,7 @@ job_t jobs[MAXJOBS];
 
 static void eval(char *cmdline);
 static int builtin_command(char **argv);
-static int parseline(char *buf, command_t *command);
+static int parseline(char *buf, command_t *command, int last);
 static void export(char **argv);
 static char *extract_pwd(char *pwd);
 static int add_job(pid_t pid, job_state_t state, char *cmdline);
@@ -64,6 +66,8 @@ static job_t *parse_arg(char *arg);
 static void waitfg(pid_t pid);
 static void reason_print(void);
 static void string_copy(char *oldstr, char *newstr);
+static size_t pipescount(char *str);
+static pid_t execute(command_t *command, sigset_t *prev_mask);
 
 void sigchld_handler(int sig) {
     int status;
@@ -148,98 +152,113 @@ static char *extract_pwd(char *pwd) {
 
 static void eval(char *cmdline) {
 
-    //char *argv[MAXARGS];
     char buf[2*MAXLINE];
-    int bg;
+    int bg = -1;
+    size_t pipes_count;
+    command_t command;
+    sigset_t prev_mask;
+    pid_t pid;
+
+    command.append = 0;
+    command.infile = NULL;
+    command.outfile = NULL;
+    command.pipe_fd_in = -1;
+    command.pipe_fd_out = -1;
+
+    pipes_count = pipescount(cmdline);
+
+    if (pipes_count == 0) {
+        string_copy(cmdline, buf);
+        bg = parseline(buf, &command, 1);
+        if (command.argv[0] == NULL)
+            return;
+
+        if (!builtin_command(command.argv)) {
+            pid = execute(&command, &prev_mask);
+            if (!bg) { 
+                int status;
+                tcsetpgrp(STDIN_FILENO, pid);
+                add_job(pid, FG, cmdline);
+                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+                waitfg(pid);
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+                reason_print();
+            } else {
+                add_job(pid, BG, cmdline);
+                sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
+            }
+        }
+        return;
+    }
+}
+
+static pid_t execute(command_t *command, sigset_t *prev_mask) {
+
     pid_t pid;
     char *path = getenv("PATH");
     char *pathdir;
     char *execute_dir = NULL;
     char dir_with_path[MAXDIRLEN];
-    command_t command;
-    sigset_t mask, prev_mask;
-    
+    sigset_t mask;
+
     size_t pathlen = strlen(path);
     char path_copy[pathlen];
 
-    command.append = 0;
-    command.infile = NULL;
-    command.outfile = NULL;
-
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
-
-    string_copy(cmdline, buf);
-    bg = parseline(buf, &command);
-    if (command.argv[0] == NULL)
-        return;
-
-    if (!builtin_command(command.argv)) {
-        if (jobs_count == 16) {
-            fprintf(stderr, "ERROR: Сouldn't launch more jobs, wait for current jobs to end.\n");
-            return;
-        }
-        if (strchr(command.argv[0], '/') == NULL) {
-            strcpy(path_copy, path);
-            pathdir = strtok(path_copy, ":");
-            while (pathdir != NULL){
-                snprintf(dir_with_path, sizeof(dir_with_path), "%s/%s", pathdir, command.argv[0]);
-                if (access(dir_with_path, X_OK) == 0) {
-                    execute_dir = dir_with_path;
-                    break;
-                }
-                pathdir = strtok(NULL, ":");
-            }
-        } else
-            execute_dir = command.argv[0];
         
-        sigprocmask(SIG_BLOCK, &mask, &prev_mask);
-        if ((pid = fork()) == 0) {
-            setpgid(0, 0);
-
-            sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
-            signal(SIGINT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
-            signal(SIGTTOU, SIG_DFL);
-            signal(SIGTTIN, SIG_DFL);
-
-            if (command.infile != NULL) {
-                int fd_in = open(command.infile, O_RDONLY);
-                dup2(fd_in, STDIN_FILENO);
-                close(fd_in);
+    if (jobs_count == 16) {
+        fprintf(stderr, "ERROR: Сouldn't launch more jobs, wait for current jobs to end.\n");
+        return -1;
+    }
+    if (strchr(command->argv[0], '/') == NULL) {
+        strcpy(path_copy, path);
+        pathdir = strtok(path_copy, ":");
+        while (pathdir != NULL){
+            snprintf(dir_with_path, sizeof(dir_with_path), "%s/%s", pathdir, command->argv[0]);
+            if (access(dir_with_path, X_OK) == 0) {
+                execute_dir = dir_with_path;
+                break;
             }
-
-            if (command.outfile != NULL) {
-                int flags = O_WRONLY | O_CREAT;
-                if (command.append) {
-                    flags |= O_APPEND;
-                } else {
-                    flags |= O_TRUNC;
-                }
-                int fd_out = open(command.outfile, flags, 0644);
-                int test_fd = dup2(fd_out, STDOUT_FILENO);
-                close(fd_out);
-            }
-
-            if (execve(execute_dir, command.argv, environ) < 0) {
-                printf("%s: Command not found.\n", command.argv[0]);
-                exit(0);
-            }
+            pathdir = strtok(NULL, ":");
         }
-        if (!bg) { 
-            int status;
-            tcsetpgrp(STDIN_FILENO, pid);
-            add_job(pid, FG, cmdline);
-            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-            waitfg(pid);
-            tcsetpgrp(STDIN_FILENO, getpgrp());
-            reason_print();
-        } else {
-            add_job(pid, BG, cmdline);
-            sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
+    } else
+        execute_dir = command->argv[0];
+        
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+    if ((pid = fork()) == 0) {
+        setpgid(0, 0);
+
+        sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+
+        if (command->infile != NULL) {
+            int fd_in = open(command->infile, O_RDONLY);
+            dup2(fd_in, STDIN_FILENO);
+            close(fd_in);
+        }
+
+        if (command->outfile != NULL) {
+            int flags = O_WRONLY | O_CREAT;
+            if (command->append) {
+                flags |= O_APPEND;
+            } else {
+                flags |= O_TRUNC;
+            }
+            int fd_out = open(command->outfile, flags, 0644);
+            int test_fd = dup2(fd_out, STDOUT_FILENO);
+            close(fd_out);
+        }
+
+        if (execve(execute_dir, command->argv, environ) < 0) {
+            printf("%s: Command not found.\n", command->argv[0]);
+            exit(0);
         }
     }
-    return;
+    return pid;
 }
 
 static void string_copy(char *oldstr, char *newstr) {
@@ -267,7 +286,7 @@ static void string_copy(char *oldstr, char *newstr) {
     *(newstr+1) = '\0';
 }
 
-static int parseline(char *buf, command_t *command) {
+static int parseline(char *buf, command_t *command, int last) {
 
     char *delim;
     int argc;
@@ -281,10 +300,9 @@ static int parseline(char *buf, command_t *command) {
 
     while ((delim = strchr(buf, ' '))) {
         *delim = '\0';
-        LOG("Current argument: %s", buf);
         if (strcmp(buf, "<") == 0) {
             expect_infile = 1;
-        } 
+        }
         else if (strcmp(buf, ">") == 0) {
             expect_outfile = 1;
             command->append = 0;
@@ -310,18 +328,22 @@ static int parseline(char *buf, command_t *command) {
     }
     /*if (*buf != '\0') {  //If there is something after all of these arguments, saving this as a pointer to this
         command->argv[argc++] = buf;
-    } */
+    }*/
     command->argv[argc] = NULL; //Last pointer is NULL
 
     if (argc == 0) return 1;
 
-    if ((bg = (*(command->argv[argc-1]) == '&')) != 0) //If the last argument is &, changing bg to 1 and pointer to this argument becomes NULL
-        command->argv[--argc] = NULL;
+    if (((bg = (*(command->argv[argc-1]) == '&')) != 0)) {
+        command->argv[--argc] = NULL; //If the last argument is &, changing bg to 1 and pointer to this argument becomes NULL
+        if (!last && (bg == 1))
+            bg = -1;
+    }
 
     return bg;
 }
 
 static int builtin_command(char **argv) {
+
     if (!strcmp(argv[0], "exit"))
         exit(0);
     if (!strcmp(argv[0], "&"))
@@ -516,4 +538,15 @@ static void reason_print() {
         }
     }
     sigprocmask(SIG_UNBLOCK, &mask_chld, NULL);
+}
+
+static size_t pipescount(char *str) {
+    size_t result = 0;
+    while (*str) {
+        if (*str == '|')
+            result++;
+
+        str++;
+    }
+    return result;
 }
