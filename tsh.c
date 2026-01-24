@@ -213,6 +213,8 @@ static void eval(char *cmdline) {
 
     pipes_count = pipescount(cmdline);
 
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_SETMASK, &mask, &prev_mask);
 
     if (pipes_count == 0) {
@@ -285,27 +287,27 @@ static void eval(char *cmdline) {
             curr_command = curr_pipe + 1;
         }
 
-        
+        if (!builtin_command(command.argv)) {
 
-        command.append = 0;
-        command.infile = NULL;
-        command.outfile = NULL;
-        command.pipe_fd_in = -1;
-        command.pipe_fd_out = -1;
-        command.pgid = firstpid;
-        total_commands++;
+            command.append = 0;
+            command.infile = NULL;
+            command.outfile = NULL;
+            command.pipe_fd_in = -1;
+            command.pipe_fd_out = -1;
+            command.pgid = firstpid;
+            total_commands++;
 
-        bg = parseline(curr_command, &command, 1);
-        if (command.argv[0] == NULL)
-            return;
-        
-        if (old_fd != -1)
-            command.pipe_fd_in = old_fd;
+            bg = parseline(curr_command, &command, 1);
+            if (command.argv[0] == NULL)
+                return;
+            
+            if (old_fd != -1)
+                command.pipe_fd_in = old_fd;
 
-        pid = execute(&command);
-        pids[total_commands-1] = pid;
+            pid = execute(&command);
+            pids[total_commands-1] = pid;
 
-        if (!bg) {
+            if (!bg) {
                 tcsetpgrp(STDIN_FILENO, firstpid);
                 add_job(firstpid, FG, cmdline, total_commands, pids);
                 sigprocmask(SIG_SETMASK, &prev_mask, NULL);
@@ -316,6 +318,7 @@ static void eval(char *cmdline) {
                 add_job(firstpid, BG, cmdline, total_commands, pids);
                 sigprocmask(SIG_SETMASK, &prev_mask, NULL);
             }
+        }
     }
 }
 
