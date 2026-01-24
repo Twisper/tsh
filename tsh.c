@@ -264,16 +264,13 @@ static void eval(char *cmdline) {
             if (command.argv[0] == NULL)
                 return;
 
-            if (pipes_count != 0) {
-                pipe(fds);
-                pipes_count--;
-                command.pipe_fd_out = fds[1];
+            if (old_fd != -1) {
+                command.pipe_fd_in = old_fd;
             }
 
-            if (old_fd != -1)
-                command.pipe_fd_in = old_fd;
-            else
-                old_fd = fds[0];
+            pipe(fds);
+            command.pipe_fd_out = fds[1];
+            old_fd = fds[0];
             
             pid = execute(&command);
 
