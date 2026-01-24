@@ -1,0 +1,40 @@
+name: Build Pipeline
+
+# Запускать при пуше и пулл-реквестах в ветку main
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Readline (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libreadline-dev
+
+    - name: Install Readline (macOS)
+      if: runner.os == 'macOS'
+      run: brew install readline
+
+    - name: Make Build
+      run: make
+
+    - name: Make Security Build
+      run: |
+        make clean
+        make security
+
+    - name: Run Shell
+      run: ./tsh <<< "exit"
