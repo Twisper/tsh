@@ -683,11 +683,15 @@ static void reason_print() {
                     delete_job(jobs+i);
                 }
                 else if ((stop_reason == SIGNAL) && (jobs[i].running_count == 0)) {
-                    printf("\nJob [%ld] (%d) terminated by signal\n", curr_jid, curr_pgid);
+                    if (jobs[i].state == BG) {
+                        printf("\nJob [%ld] (%d) was stopped by signal\n", curr_jid, curr_pgid);
+                    }
                     delete_job(jobs+i);
                 }
                 else if ((stop_reason == FREEZED) && (jobs[i].running_count == 0)) {
-                    printf("\nJob [%ld] (%d) was stopped by signal\n", curr_jid, curr_pgid);
+                    if (jobs[i].state == BG) {
+                        printf("\nJob [%ld] (%d) was stopped by signal\n", curr_jid, curr_pgid);
+                    }
                 }
                 jobs[i].flags.is_edited = 0;
                 jobs[i].flags.reason = NONE;
