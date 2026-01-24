@@ -71,7 +71,6 @@ static job_t *parse_arg(char *arg);
 static void waitfg(pid_t pgid);
 static void reason_print(void);
 static void string_copy(char *oldstr, char *newstr);
-static size_t pipescount(char *str);
 static pid_t execute(command_t *command);
 
 void sigchld_handler(int sig) {
@@ -198,7 +197,6 @@ static void eval(char *cmdline) {
     int fds[2];
     int total_commands = 0;
     pid_t pids[MAXPIPESCOUNT];
-    size_t pipes_count;
     command_t command;
     sigset_t mask, prev_mask;
     pid_t pid, firstpid = -1;
@@ -211,110 +209,87 @@ static void eval(char *cmdline) {
 
     memset(pids, 0, MAXPIPESCOUNT * sizeof(pid_t));
 
-    pipes_count = pipescount(cmdline);
-
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_SETMASK, &mask, &prev_mask);
 
-    if (pipes_count == 0) {
-        string_copy(cmdline, buf);
-        bg = parseline(buf, &command, 1);
+    string_copy(cmdline, buf);
+
+    curr_command = buf;
+
+    int i = 0;
+        
+    while ((curr_pipe = strchr(curr_command, '|'))) {
+
+        *curr_pipe = '\0';
+
+        command.append = 0;
+        command.infile = NULL;
+        command.outfile = NULL;
+        command.pipe_fd_in = -1;
+        command.pipe_fd_out = -1;
+        command.pgid = firstpid;
+
+        total_commands++;
+
+        parseline(curr_command, &command, 0);
         if (command.argv[0] == NULL)
             return;
-        command.pgid = -1;
-        if (!builtin_command(command.argv)) {
-            pid = execute(&command);
-            pids[0] = pid;
-            if (pid == -1) return;
-            if (!bg) {
-                tcsetpgrp(STDIN_FILENO, pid);
-                add_job(pid, FG, cmdline, 1, pids);
-                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-                waitfg(pid);
-                tcsetpgrp(STDIN_FILENO, getpgrp());
-                reason_print();
-            } else {
-                add_job(pid, BG, cmdline, 1, pids);
-                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-            }
-        }
-        return;
-    } else {
-        string_copy(cmdline, buf);
 
-        curr_command = buf;
-
-        int i = 0;
-        
-        while ((curr_pipe = strchr(curr_command, '|'))) {
-
-            *curr_pipe = '\0';
-
-            command.append = 0;
-            command.infile = NULL;
-            command.outfile = NULL;
-            command.pipe_fd_in = -1;
-            command.pipe_fd_out = -1;
-            command.pgid = firstpid;
-
-            total_commands++;
-
-            parseline(curr_command, &command, 0);
-            if (command.argv[0] == NULL)
-                return;
-
-            if (old_fd != -1) {
-                command.pipe_fd_in = old_fd;
-            }
-
-            pipe(fds);
-            command.pipe_fd_out = fds[1];
-            old_fd = fds[0];
-            
-            pid = execute(&command);
-
-            pids[total_commands-1] = pid;
-            
-            if (i == 0) {
-                firstpid = pid;
-                i++;
-            }
-            
-            curr_command = curr_pipe + 1;
+        if (old_fd != -1) {
+            command.pipe_fd_in = old_fd;
         }
 
-        if (!builtin_command(command.argv)) {
+        pipe(fds);
+        command.pipe_fd_out = fds[1];
+        old_fd = fds[0];
 
-            command.append = 0;
-            command.infile = NULL;
-            command.outfile = NULL;
-            command.pipe_fd_in = -1;
-            command.pipe_fd_out = -1;
-            command.pgid = firstpid;
-            total_commands++;
-
-            bg = parseline(curr_command, &command, 1);
-            if (command.argv[0] == NULL)
-                return;
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
             
-            if (old_fd != -1)
-                command.pipe_fd_in = old_fd;
+        pid = execute(&command);
 
-            pid = execute(&command);
-            pids[total_commands-1] = pid;
+        pids[total_commands-1] = pid;
+            
+        if (i == 0) {
+            firstpid = pid;
+            i++;
+        }
+            
+        curr_command = curr_pipe + 1;
+    }
 
-            if (!bg) {
-                tcsetpgrp(STDIN_FILENO, firstpid);
-                add_job(firstpid, FG, cmdline, total_commands, pids);
-                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-                waitfg(firstpid);
-                tcsetpgrp(STDIN_FILENO, getpgrp());
-                reason_print();
-            } else {
-                add_job(firstpid, BG, cmdline, total_commands, pids);
-                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-            }
+    command.append = 0;
+    command.infile = NULL;
+    command.outfile = NULL;
+    command.pipe_fd_in = -1;
+    command.pipe_fd_out = -1;
+    command.pgid = firstpid;
+    total_commands++;
+
+    bg = parseline(curr_command, &command, 1);
+
+    if (!builtin_command(command.argv)) {
+
+        if (command.argv[0] == NULL)
+            return;
+            
+        if (old_fd != -1)
+            command.pipe_fd_in = old_fd;
+
+        pid = execute(&command);
+        pids[total_commands-1] = pid;
+
+        if (!bg) {
+            tcsetpgrp(STDIN_FILENO, firstpid);
+            add_job(firstpid, FG, cmdline, total_commands, pids);
+            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+            waitfg(firstpid);
+            tcsetpgrp(STDIN_FILENO, getpgrp());
+            reason_print();
+        } else {
+            add_job(firstpid, BG, cmdline, total_commands, pids);
+            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         }
     }
 }
@@ -719,15 +694,4 @@ static void reason_print() {
         }
     }
     sigprocmask(SIG_UNBLOCK, &mask_chld, NULL);
-}
-
-static size_t pipescount(char *str) {
-    size_t result = 0;
-    while (*str) {
-        if (*str == '|')
-            result++;
-
-        str++;
-    }
-    return result;
 }
