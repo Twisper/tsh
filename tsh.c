@@ -201,7 +201,7 @@ static void eval(char *cmdline) {
     size_t pipes_count;
     command_t command;
     sigset_t mask, prev_mask;
-    pid_t pid, pgid, firstpid = -1;
+    pid_t pid, firstpid = -1;
 
     command.append = 0;
     command.infile = NULL;
@@ -285,6 +285,8 @@ static void eval(char *cmdline) {
             curr_command = curr_pipe + 1;
         }
 
+        
+
         command.append = 0;
         command.infile = NULL;
         command.outfile = NULL;
@@ -292,7 +294,14 @@ static void eval(char *cmdline) {
         command.pipe_fd_out = -1;
         command.pgid = firstpid;
         total_commands++;
+
         bg = parseline(curr_command, &command, 1);
+        if (command.argv[0] == NULL)
+            return;
+        
+        if (old_fd != -1)
+            command.pipe_fd_in = old_fd;
+
         pid = execute(&command);
         pids[total_commands-1] = pid;
 
@@ -344,7 +353,6 @@ static pid_t execute(command_t *command) {
         execute_dir = command->argv[0];
 
     if ((pid = fork()) == 0) {
-        LOG("cmd pgid: %d", command->pgid);
         if (command->pgid == -1) {
             if (setpgid(0, 0) < 0) {
                 perror("setpgid failed");
