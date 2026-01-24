@@ -15,7 +15,7 @@
 #define	MAXLINE 8192
 #define MAXARGS 128
 #define PATHDIRLEN 64
-#define MAXDIRLEN 128
+#define MAXDIRLEN 4096
 #define MAXJOBS 16
 #define MAXCMDLINE 512
 #define MAXPIPESCOUNT 32
@@ -117,6 +117,7 @@ void sigchld_handler(int sig) {
             }
         }
     }
+    errno = old_errno;
 }
 
 int main() {
@@ -128,9 +129,9 @@ int main() {
     char homedir[2] = "~";
     char *input;
     
-    for (int i = 1; i <= 16; i++) {
-        jobs[i-1].jid = (size_t)i;
-        jobs[i-1].state = UNDEF;
+    for (int i = 0; i < MAXJOBS; i++) {
+        jobs[i].jid = (size_t)(i + 1);
+        jobs[i].state = UNDEF;
         jobs[i].flags.is_edited = 0;
         jobs[i].flags.reason = NONE;
         jobs[i].running_count = 0;
@@ -304,7 +305,7 @@ static pid_t execute(command_t *command) {
     sigset_t mask;
 
     size_t pathlen = strlen(path);
-    char path_copy[pathlen];
+    char path_copy[pathlen+1];
 
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
@@ -632,7 +633,7 @@ static int add_job(pid_t pgid, job_state_t state, char *cmdline, int total_comma
             job_t *curr_job = (jobs+i);
             curr_job->pgid = pgid;
             curr_job->state = state;
-            strcpy(curr_job->cmdline, cmdline);
+            snprintf(curr_job->cmdline, MAXCMDLINE, "%s", cmdline);
             curr_job->flags.is_edited = 0;
             curr_job->flags.reason = NONE;
             curr_job->running_count = total_commands;
