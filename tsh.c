@@ -18,9 +18,10 @@
 #define MAXDIRLEN 128
 #define MAXJOBS 16
 #define MAXCMDLINE 512
+#define MAXPIPESCOUNT 32
 
 #ifdef DEBUG
-#define LOG(fmt, ...) fprintf(stderr, "[LOG] %s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
+#define LOG(fmt, ...) fprintf(stderr, "\n[LOG] %s:%d: " fmt "\n", __func__, __LINE__, ##__VA_ARGS__)
 #else
 #define LOG(fmt, ...)
 #endif
@@ -34,11 +35,14 @@ typedef struct _states{
     volatile unsigned int reason : 2;
 } states_t;
 typedef struct _job {
-    pid_t pid;
+    pid_t pgid;
     size_t jid;
     volatile job_state_t state;
     states_t flags;
+    int running_count;
+    int stopped_count;
     char cmdline[MAXCMDLINE];
+    int pids[MAXPIPESCOUNT];
 } job_t;
 
 typedef struct _command_t {
@@ -48,6 +52,7 @@ typedef struct _command_t {
     int append;
     int pipe_fd_in;
     int pipe_fd_out;
+    pid_t pgid;
 } command_t;
 
 size_t jobs_count;
@@ -57,17 +62,17 @@ job_t jobs[MAXJOBS];
 static void eval(char *cmdline);
 static int builtin_command(char **argv);
 static int parseline(char *buf, command_t *command, int last);
-static void export(char **argv);
 static char *extract_pwd(char *pwd);
-static int add_job(pid_t pid, job_state_t state, char *cmdline);
+static int add_job(pid_t pgid, job_state_t state, char *cmdline, int total_commands, pid_t *pids);
 static pid_t delete_job(job_t *job_to_del);
-static job_t *get_job(pid_t pid, size_t jid);
+static job_t *get_job_by_jid(size_t jid);
+static job_t *get_job_by_pid(pid_t pgid);
 static job_t *parse_arg(char *arg);
-static void waitfg(pid_t pid);
+static void waitfg(pid_t pgid);
 static void reason_print(void);
 static void string_copy(char *oldstr, char *newstr);
 static size_t pipescount(char *str);
-static pid_t execute(command_t *command, sigset_t *prev_mask);
+static pid_t execute(command_t *command);
 
 void sigchld_handler(int sig) {
     int status;
@@ -75,30 +80,51 @@ void sigchld_handler(int sig) {
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
-        job_t *curr_job = get_job(pid, 0);
+        job_t *curr_job = get_job_by_pid(pid);
+        if (curr_job == NULL) continue;
         if (WIFEXITED(status)) {
-            curr_job->flags.is_edited = 1;
-            curr_job->flags.reason = FINISHED;
+            curr_job->running_count -= 1;
+            if (curr_job->running_count == 0) {
+                curr_job->flags.is_edited = 1;
+                curr_job->flags.reason = FINISHED;
+                for (int i = 0; i < MAXPIPESCOUNT; i++) {
+                    if (curr_job->pids[i] == pid) {
+                        curr_job->pids[i] = 0;
+                        break;
+                    }
+                }
+            }
         }
         else if (WIFSIGNALED(status)) {
-            curr_job->flags.is_edited = 1;
-            curr_job->flags.reason = SIGNAL;
+            curr_job->running_count -= 1;
+            if (curr_job->running_count == 0) {
+                curr_job->flags.is_edited = 1;
+                curr_job->flags.reason = SIGNAL;
+                for (int i = 0; i < MAXPIPESCOUNT; i++) {
+                    if (curr_job->pids[i] == pid) {
+                        curr_job->pids[i] = 0;
+                        break;
+                    }
+                }
+            }
         }
         else if (WIFSTOPPED(status)) {
-            curr_job->flags.is_edited = 1;
-            curr_job->flags.reason = FREEZED;
-            curr_job->state = STOPPED;
+            curr_job->stopped_count += 1;
+            curr_job->running_count -= 1;
+            if (curr_job->running_count == 0) {
+                curr_job->flags.is_edited = 1;
+                curr_job->flags.reason = FREEZED;
+                curr_job->state = STOPPED;
+            }
         }
     }
 }
 
 int main() {
 
-    char cmdline[MAXLINE];
     char prompt[1024];
     char *username = getenv("USER");
     char *hostname = getenv("HOSTNAME");
-    char *cwd[1024];
     char *pwd;
     char homedir[2] = "~";
     char *input;
@@ -108,6 +134,9 @@ int main() {
         jobs[i-1].state = UNDEF;
         jobs[i].flags.is_edited = 0;
         jobs[i].flags.reason = NONE;
+        jobs[i].running_count = 0;
+        jobs[i].stopped_count = 0;
+        memset(jobs[i].pids, 0, MAXPIPESCOUNT * sizeof(pid_t));
     }
 
     signal(SIGCHLD, sigchld_handler);
@@ -126,7 +155,17 @@ int main() {
         snprintf(prompt, sizeof(prompt), "%s@%s: %s %% ", username, hostname, pwd);
         input = readline(prompt);
 
-        if (!input) break;
+        if (!input) {
+            int flag;
+            for (int i = 0; i < MAXJOBS; i++) {
+                if (jobs[i].state != UNDEF)
+                    flag = 1;
+            }
+            if (flag)
+                continue;
+            else
+                break;
+        }
 
         if (*input) add_history(input);
 
@@ -153,11 +192,16 @@ static char *extract_pwd(char *pwd) {
 static void eval(char *cmdline) {
 
     char buf[2*MAXLINE];
+    char *curr_command, *curr_pipe;
     int bg = -1;
+    int old_fd = -1;
+    int fds[2];
+    int total_commands = 0;
+    pid_t pids[MAXPIPESCOUNT];
     size_t pipes_count;
     command_t command;
-    sigset_t prev_mask;
-    pid_t pid;
+    sigset_t mask, prev_mask;
+    pid_t pid, pgid, firstpid = -1;
 
     command.append = 0;
     command.infile = NULL;
@@ -165,34 +209,108 @@ static void eval(char *cmdline) {
     command.pipe_fd_in = -1;
     command.pipe_fd_out = -1;
 
+    memset(pids, 0, MAXPIPESCOUNT * sizeof(pid_t));
+
     pipes_count = pipescount(cmdline);
+
+    sigprocmask(SIG_SETMASK, &mask, &prev_mask);
 
     if (pipes_count == 0) {
         string_copy(cmdline, buf);
         bg = parseline(buf, &command, 1);
         if (command.argv[0] == NULL)
             return;
-
+        command.pgid = -1;
         if (!builtin_command(command.argv)) {
-            pid = execute(&command, &prev_mask);
-            if (!bg) { 
-                int status;
+            pid = execute(&command);
+            pids[0] = pid;
+            if (pid == -1) return;
+            if (!bg) {
                 tcsetpgrp(STDIN_FILENO, pid);
-                add_job(pid, FG, cmdline);
+                add_job(pid, FG, cmdline, 1, pids);
                 sigprocmask(SIG_SETMASK, &prev_mask, NULL);
                 waitfg(pid);
                 tcsetpgrp(STDIN_FILENO, getpgrp());
                 reason_print();
             } else {
-                add_job(pid, BG, cmdline);
-                sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
+                add_job(pid, BG, cmdline, 1, pids);
+                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
             }
         }
         return;
+    } else {
+        string_copy(cmdline, buf);
+
+        curr_command = buf;
+
+        int i = 0;
+        
+        while ((curr_pipe = strchr(curr_command, '|'))) {
+
+            *curr_pipe = '\0';
+
+            command.append = 0;
+            command.infile = NULL;
+            command.outfile = NULL;
+            command.pipe_fd_in = -1;
+            command.pipe_fd_out = -1;
+            command.pgid = firstpid;
+
+            total_commands++;
+
+            parseline(curr_command, &command, 0);
+            if (command.argv[0] == NULL)
+                return;
+
+            if (pipes_count != 0) {
+                pipe(fds);
+                pipes_count--;
+                command.pipe_fd_out = fds[1];
+            }
+
+            if (old_fd != -1)
+                command.pipe_fd_in = old_fd;
+            else
+                old_fd = fds[0];
+            
+            pid = execute(&command);
+
+            pids[total_commands-1] = pid;
+            
+            if (i == 0) {
+                firstpid = pid;
+                i++;
+            }
+            
+            curr_command = curr_pipe + 1;
+        }
+
+        command.append = 0;
+        command.infile = NULL;
+        command.outfile = NULL;
+        command.pipe_fd_in = -1;
+        command.pipe_fd_out = -1;
+        command.pgid = firstpid;
+        total_commands++;
+        bg = parseline(curr_command, &command, 1);
+        pid = execute(&command);
+        pids[total_commands-1] = pid;
+
+        if (!bg) {
+                tcsetpgrp(STDIN_FILENO, firstpid);
+                add_job(firstpid, FG, cmdline, total_commands, pids);
+                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+                waitfg(firstpid);
+                tcsetpgrp(STDIN_FILENO, getpgrp());
+                reason_print();
+            } else {
+                add_job(firstpid, BG, cmdline, total_commands, pids);
+                sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+            }
     }
 }
 
-static pid_t execute(command_t *command, sigset_t *prev_mask) {
+static pid_t execute(command_t *command) {
 
     pid_t pid;
     char *path = getenv("PATH");
@@ -224,24 +342,30 @@ static pid_t execute(command_t *command, sigset_t *prev_mask) {
         }
     } else
         execute_dir = command->argv[0];
-        
-    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
-    if ((pid = fork()) == 0) {
-        setpgid(0, 0);
 
-        sigprocmask(SIG_UNBLOCK, &prev_mask, NULL);
+    if ((pid = fork()) == 0) {
+        LOG("cmd pgid: %d", command->pgid);
+        if (command->pgid == -1) {
+            if (setpgid(0, 0) < 0) {
+                perror("setpgid failed");
+                exit(1);
+            }
+        } else
+            setpgid(0, command->pgid);
+
+        sigprocmask(SIG_UNBLOCK, &mask, NULL);
         signal(SIGINT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
         signal(SIGTTOU, SIG_DFL);
         signal(SIGTTIN, SIG_DFL);
 
-        if (command->infile != NULL) {
+        if ((command->infile != NULL) && (command->pipe_fd_in == -1)) {
             int fd_in = open(command->infile, O_RDONLY);
             dup2(fd_in, STDIN_FILENO);
             close(fd_in);
         }
 
-        if (command->outfile != NULL) {
+        if ((command->outfile != NULL) && (command->pipe_fd_out == -1)) {
             int flags = O_WRONLY | O_CREAT;
             if (command->append) {
                 flags |= O_APPEND;
@@ -249,13 +373,35 @@ static pid_t execute(command_t *command, sigset_t *prev_mask) {
                 flags |= O_TRUNC;
             }
             int fd_out = open(command->outfile, flags, 0644);
-            int test_fd = dup2(fd_out, STDOUT_FILENO);
+            dup2(fd_out, STDOUT_FILENO);
             close(fd_out);
+        }
+
+        if (command->pipe_fd_in != -1) {
+            dup2(command->pipe_fd_in, STDIN_FILENO);
+        }
+
+        if (command->pipe_fd_out != -1) {
+            dup2(command->pipe_fd_out, STDOUT_FILENO);
         }
 
         if (execve(execute_dir, command->argv, environ) < 0) {
             printf("%s: Command not found.\n", command->argv[0]);
             exit(0);
+        }
+    }
+    if (pid > 0) {
+        if (command->pgid == -1)
+            setpgid(pid, pid);
+        else
+            setpgid(pid, command->pgid);
+
+        if (command->pipe_fd_in != -1) {
+            close(command->pipe_fd_in);
+        }
+
+        if (command->pipe_fd_out != -1) {
+            close(command->pipe_fd_out);
         }
     }
     return pid;
@@ -293,7 +439,7 @@ static int parseline(char *buf, command_t *command, int last) {
     int bg;
     int expect_infile = 0, expect_outfile = 0;
 
-    while (*buf && (*buf == ' ')) //Skipping spaces in the beginning
+    while (*buf && (*buf == ' '))
         buf++;
 
     argc = 0;
@@ -326,15 +472,12 @@ static int parseline(char *buf, command_t *command, int last) {
         buf = delim + 1;
         while (*buf && (*buf == ' ')) buf++;
     }
-    /*if (*buf != '\0') {  //If there is something after all of these arguments, saving this as a pointer to this
-        command->argv[argc++] = buf;
-    }*/
-    command->argv[argc] = NULL; //Last pointer is NULL
+    command->argv[argc] = NULL;
 
     if (argc == 0) return 1;
 
     if (((bg = (*(command->argv[argc-1]) == '&')) != 0)) {
-        command->argv[--argc] = NULL; //If the last argument is &, changing bg to 1 and pointer to this argument becomes NULL
+        command->argv[--argc] = NULL;
         if (!last && (bg == 1))
             bg = -1;
     }
@@ -398,55 +541,75 @@ static int builtin_command(char **argv) {
             if (jobs[i].state != UNDEF) {
                 if (jobs[i].state == STOPPED) state = "suspended";
                 else state = "running";
-                printf("[%ld] (%d) %s %s\n", jobs[i].jid, jobs[i].pid, state, jobs[i].cmdline);
+                printf("[%ld] (%d) %s %s\n", jobs[i].jid, jobs[i].pgid, state, jobs[i].cmdline);
             }
         }
         return 1;
     }
     if (!strcmp(argv[0], "fg")) {
         job_t *job = parse_arg(argv[1]);
-        if (job == NULL) {
+        if ((job == NULL) || (job->state == UNDEF)) {
             fprintf(stderr, "fg: No such job\n");
             return 1;
         }
         
-        job->state = FG;
-        tcsetpgrp(STDIN_FILENO, job->pid);
-        kill(job->pid, SIGCONT);
-        waitfg(job->pid);
-        if (tcsetpgrp(STDIN_FILENO, getpgrp()) < 0) {
-            perror("tcsetpgrp failed");
+        if (jobs->state == STOPPED) {
+            job->running_count = job->stopped_count;
+            job->stopped_count = 0;
         }
+        job->state = FG;
+        job->flags.is_edited = 0;
+        job->flags.reason = NONE;
+        tcsetpgrp(STDIN_FILENO, job->pgid);
+        kill(-(job->pgid), SIGCONT);
+
+        waitfg(job->pgid);
+        tcsetpgrp(STDIN_FILENO, getpgrp());
         reason_print();   
         return 1;
     }
     if (!strcmp(argv[0], "bg")) {
         job_t *job = parse_arg(argv[1]);
-        if (job == NULL) return 1;
+        if ((job == NULL) || (job->state == UNDEF)) {
+            fprintf(stderr, "bg: No such job\n");
+            return 1;
+        }
 
+        if (job->state == STOPPED) {
+            job->running_count = job->stopped_count;
+            job->stopped_count = 0;
+        }
         job->state = BG;
-        kill(job->pid, SIGCONT);
+        job->flags.is_edited = 0;
+        job->flags.reason = NONE;
+        kill(-(job->pgid), SIGCONT);
         return 1;
     }
     if (!strcmp(argv[0], "kill")) {
         job_t *job = parse_arg(argv[1]);
-        if (job == NULL) { return 1; }
-        
-        kill(job->pid, SIGINT);
+        if ((job == NULL) || (job->state == UNDEF)) {
+            fprintf(stderr, "kill: No such job\n");
+            return 1;
+        }
+        kill(-(job->pgid), SIGINT);
         return 1;
     }
     return 0;
 }
 
-void waitfg(pid_t pid) {
-    sigset_t empty_mask;
-    job_t *curr_job = get_job(pid, 0);
+void waitfg(pid_t pgid) {
+    sigset_t empty_mask, mask, prev_mask;
+    job_t *curr_job = get_job_by_pid(pgid);
 
     sigemptyset(&empty_mask);
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
 
-    while (curr_job != NULL && curr_job->state == FG && curr_job->flags.is_edited == 0) {
+    sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+    while (curr_job->state == FG && curr_job->running_count > 0 && curr_job->flags.is_edited == 0) {
         sigsuspend(&empty_mask);
     }
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
 }
 
 static job_t *parse_arg(char *arg) {
@@ -454,37 +617,45 @@ static job_t *parse_arg(char *arg) {
 
     if (arg[0] == '%') {
         int jid = atoi(&arg[1]);
-        return get_job(-1, jid);
+        return get_job_by_jid(jid);
     } else {
         pid_t pid = atoi(arg);
-        return get_job(pid, 0);
+        return get_job_by_pid(pid);
     }
 }
 
-static job_t *get_job(pid_t pid, size_t jid) {
-    if ((pid != -1) && (jid == 0)) {
-        for (int i = 0; i < 16; i++) {
-            if (jobs[i].pid == pid)
-                return (jobs+i);
-        }
-    } else if ((pid == -1) && (jid != 0)) {
-        for (int i = 0; i < 16; i++) {
-            if (jobs[i].jid == jid)
-                return (jobs+i);
+static job_t *get_job_by_jid(size_t jid) {
+    for (int i = 0; i < 16; i++) {
+        if (jobs[i].jid == jid)
+            return &jobs[i];
+    }
+    return NULL;
+}
+
+job_t *get_job_by_pid(pid_t pid) {
+    for (int i = 0; i < MAXJOBS; i++) {
+        if (jobs[i].pgid == pid) return &jobs[i];
+        if (jobs[i].state == UNDEF) continue;
+        for (int j = 0; j < MAXPIPESCOUNT; j++) {
+            if (jobs[i].pids[j] == pid) return &jobs[i];
         }
     }
     return NULL;
 }
 
-static int add_job(pid_t pid, job_state_t state, char *cmdline) {
+static int add_job(pid_t pgid, job_state_t state, char *cmdline, int total_commands, pid_t *pids) {
     for (int i = 0; i < 16; i++) {
         if (jobs[i].state == UNDEF) {
             job_t *curr_job = (jobs+i);
-            curr_job->pid = pid;
+            curr_job->pgid = pgid;
             curr_job->state = state;
             strcpy(curr_job->cmdline, cmdline);
             curr_job->flags.is_edited = 0;
-            curr_job->flags.is_edited = NONE;
+            curr_job->flags.reason = NONE;
+            curr_job->running_count = total_commands;
+            curr_job->stopped_count = 0;
+            memcpy(curr_job->pids, pids, MAXPIPESCOUNT*sizeof(pid_t));
+            jobs_count++;
             return 0;
         }      
     }
@@ -498,11 +669,13 @@ static pid_t delete_job(job_t *job_to_del) {
         return -1;
     }
 
-    job_to_del->pid = -1;
+    job_to_del->pgid = -1;
     job_to_del->state = UNDEF;
     memset(job_to_del->cmdline, 0, MAXCMDLINE);
     job_to_del->flags.is_edited = 0;
-    job_to_del->flags.is_edited = NONE;
+    job_to_del->flags.reason = NONE;
+    memset(job_to_del->pids, 0, MAXPIPESCOUNT * sizeof(pid_t));
+    jobs_count--;
     return 0;
 }
 
@@ -518,19 +691,19 @@ static void reason_print() {
             if (jobs[i].flags.is_edited == 1) {
                 reason_t stop_reason = jobs[i].flags.reason;
                 size_t curr_jid = jobs[i].jid;
-                pid_t curr_pid = jobs[i].pid;
-                if (stop_reason == FINISHED) {
+                pid_t curr_pgid = jobs[i].pgid;
+                if ((stop_reason == FINISHED)  && (jobs[i].running_count == 0)) {
                     if (jobs[i].state == BG) {
-                        printf("Job [%ld] (%d) is finished\n", curr_jid, curr_pid);
+                        printf("Job [%ld] (%d) is finished\n", curr_jid, curr_pgid);
                     }
                     delete_job(jobs+i);
                 }
-                else if (stop_reason == SIGNAL) {
-                    printf("\nJob [%ld] (%d) terminated by signal\n", curr_jid, curr_pid);
+                else if ((stop_reason == SIGNAL) && (jobs[i].running_count == 0)) {
+                    printf("\nJob [%ld] (%d) terminated by signal\n", curr_jid, curr_pgid);
                     delete_job(jobs+i);
                 }
-                else if (stop_reason == FREEZED) {
-                    printf("\nJob [%ld] (%d) stopped by signal\n", curr_jid, curr_pid);
+                else if ((stop_reason == FREEZED) && (jobs[i].running_count == 0)) {
+                    printf("\nJob [%ld] (%d) was stopped by signal\n", curr_jid, curr_pgid);
                 }
                 jobs[i].flags.is_edited = 0;
                 jobs[i].flags.reason = NONE;
